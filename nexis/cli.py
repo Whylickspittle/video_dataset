@@ -1,4 +1,13 @@
 """Nexis CLI: mine, train, validate, commit-credentials."""
+"""
+Nexis CLI 入口。
+
+提供四个核心命令：
+1. nexis mine          → 运行矿工循环，持续生成数据集
+2. nexis train         → Owner 训练循环（GPU 训练）
+3. nexis validate      → 验证者循环（VBench 评分 + 权重提交）
+4. nexis commit-credentials → 将矿工 R2 读取凭据提交到链上
+"""
 
 from __future__ import annotations
 
@@ -55,6 +64,7 @@ _WEIGHT_RETRY_BACKOFF_MAX_SEC = 300
 
 
 def _configure_logging(level: str, *, debug: bool = False) -> None:
+    """配置日志输出（使用 rich 美化格式）。"""
     configured_level = logging.DEBUG if debug else getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
         level=configured_level,
@@ -75,6 +85,7 @@ def _configure_logging(level: str, *, debug: bool = False) -> None:
 
 
 def _resolve_hotkey_ss58_from_wallet(settings: Settings) -> str:
+    """从 Bittensor 钱包解析 hotkey 的 SS58 地址。"""
     import bittensor as bt
 
     wallet = bt.wallet(
@@ -95,6 +106,7 @@ def _resolve_hotkey_ss58_from_wallet(settings: Settings) -> str:
 
 
 def _build_miner_credentials(settings: Settings, *, hotkey: str) -> R2Credentials:
+    """构建矿工 R2 凭据（bucket 名 = 小写 hotkey）。"""
     return R2Credentials(
         account_id=settings.r2_account_id,
         bucket_name=bucket_name_for_hotkey(hotkey),
@@ -107,11 +119,7 @@ def _build_miner_credentials(settings: Settings, *, hotkey: str) -> R2Credential
 
 
 def _build_captioner(settings: Settings) -> Captioner:
-    """Build a captioner from settings; OpenAI is preferred when both keys set.
-
-    If neither key is set the returned captioner is disabled and emits
-    empty captions (the trainer falls back to NEXIS_TRAINER_DEFAULT_PROMPT).
-    """
+    """构建 Captioner；优先使用 OpenAI，其次 Gemini；都没有则返回空 captioner。"""
     openai_key = settings.openai_api_key.strip()
     gemini_key = settings.gemini_api_key.strip()
     if openai_key:
@@ -131,23 +139,12 @@ def _build_captioner(settings: Settings) -> Captioner:
 
 
 def _eval_data_local_dir(settings: Settings) -> Path:
-    """Local directory under the workdir where the eval bucket is synced.
-
-    Lives at `<workdir>/eval_data/`. The workdir is bind-mounted 1:1 between
-    host and validator/trainer container in docker compose, so this path is
-    valid to pass into sibling-container `-v` mounts as-is.
-    """
+    """eval_data 的本地同步目录：`<workdir>/eval_data/`。"""
     return (settings.workdir / "eval_data").resolve()
 
 
 async def _refresh_eval_data(settings: Settings) -> Path:
-    """Download the latest eval dataset from the nexis-eval bucket.
-
-    Called by `nexis train` and `nexis validate` before each cycle. Raises
-    `RuntimeError` on credential failure or a complete download failure —
-    cycles cannot proceed with empty/stale eval data, and bubbling up lets
-    the loop's outer try/except handle the retry + sleep.
-    """
+    """从 nexis-eval bucket 同步最新评估数据集到本地。"""
     local_dir = _eval_data_local_dir(settings)
     store = build_eval_data_store(
         account_id=settings.nexis_eval_account_id,
@@ -176,6 +173,7 @@ async def _refresh_eval_data(settings: Settings) -> Path:
 
 
 def _build_record_info_store(settings: Settings) -> R2S3Store | None:
+    """构建全局去重索引的 R2 存储客户端。"""
     creds = build_nexis_miner_credentials(
         account_id=settings.record_info_account_id,
         bucket_name=settings.record_info_bucket,
@@ -195,6 +193,7 @@ def _build_nexis_miner_bucket(
     *,
     require_write: bool,
 ) -> NexisMinerBucket | None:
+    """构建共享 nexis_miner bucket 客户端。"""
     creds = build_nexis_miner_credentials(
         account_id=settings.nexis_miner_account_id,
         bucket_name=settings.nexis_miner_bucket,
@@ -215,6 +214,7 @@ def _build_nexis_miner_bucket(
 
 
 async def _sleep_poll(seconds: float) -> None:
+    """按指定秒数休眠。"""
     await asyncio.sleep(max(seconds, 1.0))
 
 
@@ -223,6 +223,7 @@ async def _sleep_poll(seconds: float) -> None:
 
 @app.command("commit-credentials")
 def commit_credentials() -> None:
+    """将矿工 R2 读取凭据提交到链上（验证者凭此发现矿工 bucket）。"""
     from .chain.credentials import ReadCredentialCommitmentManager
 
     settings = load_settings()
@@ -249,6 +250,7 @@ def commit_credentials() -> None:
 def mine(
     debug: bool = typer.Option(False, "--debug", help="Enable verbose debug logging."),
 ) -> None:
+    """运行矿工循环，持续生成并上传数据集。"""
     settings = load_settings()
     hotkey_ss58 = _resolve_hotkey_ss58_from_wallet(settings)
     _configure_logging("INFO", debug=debug)
@@ -286,6 +288,7 @@ async def _run_miner_loop(
     pipeline: MinerPipeline,
     hotkey_ss58: str,
 ) -> None:
+    """矿工无限循环：每隔 miner_loop_sleep_sec 生成并上传一个新 interval。"""
     console.print(f"miner loop started: sleep_sec={settings.miner_loop_sleep_sec}")
     while True:
         try:
@@ -316,6 +319,7 @@ def train(
     num_gpus: int = typer.Option(0, "--num-gpus", help="GPU count (0 = read from settings)."),
     debug: bool = typer.Option(False, "--debug", help="Enable verbose debug logging."),
 ) -> None:
+    """Owner 训练循环：验证数据集 → GPU 训练 → 上传结果。"""
     settings = load_settings()
     validator_hotkey = _resolve_hotkey_ss58_from_wallet(settings)
     _configure_logging("INFO", debug=debug)
@@ -354,6 +358,7 @@ async def _load_global_record_index(
     object_key: str,
     workdir: Path,
 ) -> dict[str, list[float]]:
+    """从 record_info.json 加载全局去重索引。"""
     if record_info_store is None:
         return {}
     try:
@@ -396,6 +401,7 @@ async def _run_train_loop(
     record_info_store: R2S3Store | None,
     pool: DockerGPUPool,
 ) -> None:
+    """Owner 训练无限循环。"""
     from .chain.credentials import ReadCredentialCommitmentManager
 
     manager = ReadCredentialCommitmentManager(
@@ -480,10 +486,6 @@ async def _run_train_loop(
                 cycle_workdir = settings.workdir / "trainer"
                 cycle_workdir.mkdir(parents=True, exist_ok=True)
 
-                # Refresh the canonical eval dataset from R2 before every
-                # cycle so the trainer always uses the latest evaluation
-                # prompts/images. Raises if the bucket is misconfigured —
-                # the outer try/except logs and retries on the next tick.
                 eval_data_dir = await _refresh_eval_data(settings)
 
                 result = await run_training_cycle(
@@ -512,6 +514,7 @@ async def _run_train_loop(
 
 
 def _build_reporter(settings: Settings, validator_hotkey: str) -> ValidationResultReporter | None:
+    """构建验证结果上报器（可选）。"""
     import bittensor as bt
 
     api_url = settings.validation_api_url.strip()
@@ -537,6 +540,7 @@ def _build_reporter(settings: Settings, validator_hotkey: str) -> ValidationResu
 def validate(
     debug: bool = typer.Option(False, "--debug", help="Enable verbose debug logging."),
 ) -> None:
+    """运行验证者循环：VBench 评分 + 链上权重提交。"""
     settings = load_settings()
     validator_hotkey = _resolve_hotkey_ss58_from_wallet(settings)
     _configure_logging("INFO", debug=debug)
@@ -564,6 +568,7 @@ async def _run_validate_loop(
     validator_hotkey: str,
     nexis_miner: NexisMinerBucket,
 ) -> None:
+    """验证者无限循环：同时运行评分循环和权重提交循环。"""
     reporter = _build_reporter(settings, validator_hotkey)
     scoring_task = asyncio.create_task(
         _scoring_loop(
@@ -598,6 +603,7 @@ async def _scoring_loop(
     nexis_miner: NexisMinerBucket,
     reporter: ValidationResultReporter | None,
 ) -> None:
+    """评分循环：对已完成训练的 cycle 运行 VBench 评分并提交到 API。"""
     last_scored_cycle: int | None = None
     while True:
         try:
@@ -612,8 +618,6 @@ async def _scoring_loop(
             else:
                 workdir = settings.workdir / "scorer" / str(cycle_id)
                 workdir.mkdir(parents=True, exist_ok=True)
-                # Pull the canonical eval dataset before scoring so VBench
-                # uses the same prompts/images the trainer just used.
                 eval_data_dir = await _refresh_eval_data(settings)
                 scores = await score_cycle(
                     settings=settings,
@@ -642,6 +646,7 @@ async def _find_total_score_cycle(
     *,
     max_lookback: int = 10,
 ) -> tuple[int, dict[str, Any]] | None:
+    """查找最近有 total_score.json 的 cycle。"""
     cycles = await nexis_miner.list_cycle_ids()
     for cycle_id in reversed(cycles[-max_lookback:]):
         if not await nexis_miner.has_total_score(cycle_id):
@@ -659,6 +664,7 @@ async def _set_weight_loop(
     validator_hotkey: str,
     nexis_miner: NexisMinerBucket,
 ) -> None:
+    """权重提交循环：每 300 区块按 Top-5 排名提交链上权重。"""
     last_submitted_epoch: int | None = None
     weight_failure_count = 0
     next_retry_ts = 0.0

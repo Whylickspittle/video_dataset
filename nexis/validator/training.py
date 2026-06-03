@@ -20,6 +20,22 @@ Phase ordering:
      `nexis_miner/{cycle_id}/{miner_hotkey}/...` sequentially.
   4. Persist training_state.json and clean up the cycle scratch dir.
 """
+"""
+Owner 训练编排器。
+
+本模块只在验证者 hotkey 等于 NEXIS_OWNER_VALIDATOR_HOTKEY 时执行，
+负责一个完整的训练周期的全流程：
+1. 筛选候选矿工
+2. 并行验证数据集
+3. 并行 GPU 训练
+4. 上传训练结果
+5. 清理临时目录
+
+关键概念：
+- cycle: 一个训练/评分周期（包含多个矿工的训练和评测）
+- candidate: 通过验证的矿工候选
+- training_state: 记录每个矿工上次被训练的 interval_id
+"""
 
 from __future__ import annotations
 
@@ -49,7 +65,7 @@ from .docker_runner import DockerGPUPool, DockerRunResult
 logger = logging.getLogger(__name__)
 
 
-# Trainer container internal paths (do NOT change without coordinating with the image).
+# ── Trainer 容器内部固定路径（与 Docker 镜像硬编码对应，不可随意修改） ──
 TRAIN_CONTAINER_MODELS_DIR = "/workspace/training/Wan2.2DatasetAnalsis/h100_dataset_training/models"
 TRAIN_CONTAINER_RUNS_DIR = "/workspace/training/Wan2.2DatasetAnalsis/h100_dataset_training/runs"
 TRAIN_CONTAINER_CONFIG_JSON = "/workspace/training/Wan2.2DatasetAnalsis/h100_dataset_training/config.json"
@@ -60,39 +76,40 @@ TRAIN_CONTAINER_OUTPUTS = "/workspace/outputs"
 
 @dataclass
 class TrainingCandidate:
-    miner_hotkey: str
-    interval_id: int
-    miner_dir: Path
+    """通过验证的矿工候选。"""
+    miner_hotkey: str      # 矿工地址
+    interval_id: int       # 被选中训练的 interval 编号
+    miner_dir: Path        # 数据集本地目录
 
 
 @dataclass
 class TrainedMiner:
-    miner_hotkey: str
-    interval_id: int
-    outputs_dir: Path
-    # Path to the per-miner dataset dir (containing dataset.parquet + clips/).
-    # Kept around through the upload phase so dataset_index.json can be
-    # generated from the same parquet the trainer consumed.
-    miner_dir: Path
+    """训练完成的矿工。"""
+    miner_hotkey: str      # 矿工地址
+    interval_id: int       # 实际训练的 interval 编号
+    outputs_dir: Path      # 训练输出目录（包含生成视频）
+    miner_dir: Path        # 数据集目录（用于生成 dataset_index.json）
 
 
 @dataclass
 class TrainingCycleResult:
+    """一个训练周期的完整结果统计。"""
     cycle_id: int
-    accepted: list[str] = field(default_factory=list)
-    rejected: list[str] = field(default_factory=list)
-    trained: list[str] = field(default_factory=list)
-    failed_training: list[str] = field(default_factory=list)
-    uploaded: list[str] = field(default_factory=list)
-    failed_upload: list[str] = field(default_factory=list)
+    accepted: list[str] = field(default_factory=list)       # 被接受的矿工
+    rejected: list[str] = field(default_factory=list)       # 被拒绝的矿工
+    trained: list[str] = field(default_factory=list)        # 训练成功的矿工
+    failed_training: list[str] = field(default_factory=list)  # 训练失败的矿工
+    uploaded: list[str] = field(default_factory=list)       # 上传成功的矿工
+    failed_upload: list[str] = field(default_factory=list)  # 上传失败的矿工
 
 
 def _train_state_path(workdir: Path) -> Path:
+    """training_state.json 的本地路径。"""
     return workdir / "training_state.json"
 
 
 def load_training_state(workdir: Path) -> dict[str, int]:
-    """Return dict[miner_hotkey] -> last trained interval_id."""
+    """加载训练状态：{miner_hotkey: 上次训练的 interval_id}。"""
     path = _train_state_path(workdir)
     if not path.exists():
         return {}
@@ -106,6 +123,7 @@ def load_training_state(workdir: Path) -> dict[str, int]:
 
 
 def save_training_state(workdir: Path, state: dict[str, int]) -> None:
+    """持久化训练状态到本地 JSON。"""
     path = _train_state_path(workdir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
@@ -118,14 +136,15 @@ async def select_eligible_hotkeys(
     blacklist_hotkeys: set[str],
     last_winners: set[str],
 ) -> list[str]:
-    """Pick miners to validate this cycle.
+    """
+    筛选本轮有资格被验证的矿工。
 
-    Eligibility rule:
-        (last_winner OR not in invalid_hotkeys) AND not in blacklist_hotkeys
+    资格规则：(上一轮 Top-5 获胜者 OR 不在 invalid 列表中) AND 不在黑名单中
 
-    Blacklisted hotkeys are unconditionally excluded — winning the previous
-    cycle does not grant an exemption from the blacklist. `invalid_hotkeys`
-    is the soft "already-selected" set that last cycle's winners can override.
+    说明：
+    - blacklist: 永久排除，无条件
+    - invalid: 上一轮已被选中的矿工（无论是接受还是拒绝），本轮不再重复验证，
+               除非他们进入了上一轮 Top-5（last_winners 可覆盖 invalid）
     """
     eligible: list[str] = []
     for hotkey in candidate_hotkeys:
@@ -137,7 +156,11 @@ async def select_eligible_hotkeys(
 
 
 def parse_last_winners(total_score_payload: dict[str, Any] | None, top_k: int = 5) -> set[str]:
-    """Top-K hotkeys by aggregate score from a `total_score.json` payload."""
+    """
+    从 total_score.json 中提取上一轮 Top-K 获胜者。
+
+    按 aggregate 分数降序排列，取前 K 名。
+    """
     if not total_score_payload:
         return set()
     scores = total_score_payload.get("scores")
@@ -168,18 +191,11 @@ def build_train_volumes(
     eval_data_dir: Path,
     config_json: Path | None = None,
 ) -> list[tuple[Path | str, Path | str, str]]:
-    """Build the docker -v mounts for the trainer container.
+    """
+    构建 Trainer Docker 容器的 -v 挂载列表。
 
-    Container-side paths are fixed (the trainer image hardcodes them); host
-    paths come from settings + per-miner workdir.
-
-    `eval_data_dir` is the freshly-synced local copy of the network's eval
-    dataset (typically `<workdir>/eval_data`). The caller is responsible
-    for downloading it from the nexis-eval bucket before invoking this.
-
-    All host paths are resolved to absolute paths because docker treats a
-    relative path on the left of `-v` as a named-volume identifier, which
-    silently creates an empty volume instead of bind-mounting the directory.
+    容器内路径是硬编码的（镜像内部写死），宿主机路径来自 settings + workdir。
+    注意：宿主机路径必须解析为绝对路径，因为 docker 把相对路径当作 named volume。
     """
     dataset_container_path = f"{TRAIN_CONTAINER_DATASET_BASE}/{miner_hotkey}"
     return [
@@ -193,6 +209,12 @@ def build_train_volumes(
 
 
 def trainer_command() -> list[str]:
+    """
+    Trainer 容器内部执行的命令。
+
+    先运行 02_train_dataset.py 训练 LoRA，
+    再运行 05_eval_with_images.py 在 eval_data 上生成视频。
+    """
     return [
         "bash",
         "-c",
@@ -214,18 +236,17 @@ async def run_train_container(
     workdir: Path,
     eval_data_dir: Path,
 ) -> Path | None:
-    """Train one miner. Returns the local outputs_dir if successful, else None.
+    """
+    在 GPU 上训练单个矿工的数据集。
 
-    NB: this function does NOT upload anything. Uploads are deferred until
-    every container in the cycle has finished.
+    返回本地 outputs_dir 路径（成功）或 None（失败）。
+    注意：本函数只负责训练，不上传结果。上传延后到所有容器结束后统一进行。
     """
     miner_dir = candidate.miner_dir
     miner_hotkey = candidate.miner_hotkey
 
-    # Convert parquet -> manifest.jsonl in-place (the trainer image reads it via
-    # DATASET_MANIFEST). Paths inside the manifest must be CONTAINER paths, since
-    # the trainer image opens them after the host bind-mount remaps the location.
-    # Captions are guaranteed non-empty by dataset_check.validate_miner_dataset.
+    # 将矿工的 parquet 数据集转换为 Trainer 需要的 manifest.jsonl 格式
+    # manifest 中的路径必须是容器内路径（因为 Trainer 在容器里读取文件）
     container_dataset_dir = f"{TRAIN_CONTAINER_DATASET_BASE}/{miner_hotkey}"
     convert_to_trainer_manifest(
         miner_dir=miner_dir,
@@ -237,11 +258,9 @@ async def run_train_container(
     runs_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Per-miner config.json copy: the trainer image rewrites this file
-    # in place at startup, so a single shared inode across parallel
-    # containers races (miner A clobbers the manifest field that miner
-    # B's entrypoint just wrote, then B's python step opens config.json
-    # and tries to load A's manifest). Each miner gets its own copy.
+    # 每个矿工需要独立的 config.json 副本。
+    # 原因：Trainer 启动时会改写 config.json（写入 manifest 路径），
+    # 如果多个容器共享同一个文件，会导致竞态（矿工 A 写入的路径被矿工 B 读取）。
     config_src = Path(settings.trainer_config_json).resolve()
     miner_config_path = workdir / "configs" / miner_hotkey / "config.json"
     miner_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,6 +323,14 @@ async def upload_miner_outputs(
     workdir: Path,
     upload_concurrency: int = 8,
 ) -> bool:
+    """
+    上传单个矿工的训练结果到共享 bucket。
+
+    上传内容包括：
+    - 训练生成的所有视频文件
+    - _done.json（标记训练完成）
+    - dataset_index.json（用于全局去重索引更新）
+    """
     miner_hotkey = trained.miner_hotkey
     outputs_dir = trained.outputs_dir
     files = sorted(p for p in outputs_dir.rglob("*") if p.is_file())
@@ -361,11 +388,8 @@ async def upload_miner_outputs(
     )
     await nexis_miner.upload_path(f"{cycle_id}/{miner_hotkey}/_done.json", done_marker)
 
-    # dataset_index.json: list of (source_url, clip_start_sec) for every row in
-    # the dataset we just trained on. The API uses this when the OWNER posts
-    # scores to update `record_info.json` (top-5 miners feed the global
-    # overlap snapshot). Built from the same parquet the trainer consumed,
-    # so it's authoritative for THIS cycle's training data.
+    # dataset_index.json: 列出本次训练数据集中所有 (source_url, clip_start_sec)。
+    # Owner POST 分数时，API 用它来更新 record_info.json（全局去重索引）。
     parquet_path = trained.miner_dir / "dataset.parquet"
     if parquet_path.exists():
         try:
@@ -414,10 +438,12 @@ async def upload_miner_outputs(
 async def _miner_upload_time(
     store: R2S3Store, interval_id: int, manifest_path: Path
 ) -> Any:
-    """Return the most-trustworthy timestamp we have for when this miner
-    uploaded its dataset. Prefer R2's LastModified on dataset.parquet (set
-    by R2 at PUT time, unspoofable by the miner); fall back to the manifest's
-    self-reported `created_at` if the head request fails."""
+    """
+    获取矿工数据集最可信的上传时间戳。
+
+    优先使用 R2 上 dataset.parquet 的 LastModified（由 R2 在 PUT 时设置，矿工无法伪造）；
+    如果获取失败，回退到 manifest.json 的 created_at（矿工自己上报，可信度较低）。
+    """
     try:
         ts = await store.get_object_last_modified(f"{interval_id}/dataset.parquet")
         if ts is not None:
@@ -436,13 +462,13 @@ async def _filter_cross_miner_overlap(
     candidates: list[TrainingCandidate],
     store_for_hotkey: Callable[[str], R2S3Store],
 ) -> tuple[list[TrainingCandidate], list[DatasetCheckOutcome]]:
-    """Reject candidates whose dataset overlaps an *earlier-uploaded* candidate
-    by more than CROSS_MINER_OVERLAP_REJECT_THRESHOLD rows.
+    """
+    跨矿工去重：拒绝与先上传矿工重叠超过 100 条的后上传者。
 
-    Overlap is measured on (canonical_source_url, clip_start_sec) within
-    ±OVERLAP_WINDOW_SEC. The earlier uploader (by R2 LastModified on
-    dataset.parquet) keeps its slot; later uploaders that exceed the
-    threshold against any kept candidate are dropped.
+    判定依据：
+    - 重叠 = 同一 canonical_url + start_sec 差 < 4.5 秒
+    - 时间判定：R2 LastModified（不可伪造）> manifest created_at（回退）
+    - 先上传者保留，后上传者如果与任何保留者重叠 > 100 条则被拒
     """
     if len(candidates) < 2:
         return candidates, []
@@ -469,9 +495,8 @@ async def _filter_cross_miner_overlap(
             upload_time = None
         enriched.append((cand, upload_time, build_overlap_index(records), len(records)))
 
-    # Sort by upload_time ascending; ties broken by hotkey for determinism.
-    # Candidates with no resolvable timestamp sort last (they have no priority
-    # claim and cannot displace anyone who does).
+    # 按上传时间升序排列；时间相同则按 hotkey 排序以保证确定性
+    # 无法解析时间戳的排在最后（不能抢占别人）
     enriched.sort(
         key=lambda t: (t[1] is None, t[1], t[0].miner_hotkey)
     )
@@ -522,12 +547,13 @@ async def gather_candidates(
     miner_concurrency: int = 4,
     download_concurrency: int = 16,
 ) -> tuple[list[TrainingCandidate], list[DatasetCheckOutcome]]:
-    """Validate candidate miners in parallel.
+    """
+    并行验证所有候选矿工的数据集。
 
-    Each miner runs `validate_miner_dataset` independently behind a
-    semaphore; within a single miner, asset downloads are themselves
-    parallelized via `download_concurrency`.  Effective concurrent GETs
-    against R2 ≈ miner_concurrency × download_concurrency.
+    并发控制：
+    - miner_concurrency: 同时验证多少个矿工（默认 4）
+    - download_concurrency: 单个矿工内部同时下载多少个文件（默认 16）
+    - 实际并发 GET 数 ≈ miner_concurrency × download_concurrency
     """
     cycle_workdir = workdir / "cycle" / str(cycle_id)
     miner_sem = asyncio.Semaphore(max(int(miner_concurrency), 1))
@@ -549,6 +575,7 @@ async def gather_candidates(
             if interval_id is None:
                 logger.info("hotkey=%s has no uploaded interval; skipping", hotkey)
                 return hotkey, None, None
+            # 如果该矿工的最新 interval 已经被训练过，跳过
             last_seen = training_state.get(hotkey)
             if last_seen is not None and interval_id <= last_seen:
                 logger.info(
@@ -593,10 +620,7 @@ async def gather_candidates(
         elif outcome is not None:
             rejections.append(outcome)
 
-    # Cross-miner overlap: drop later-uploaders whose datasets duplicate an
-    # earlier accepted miner's by > CROSS_MINER_OVERLAP_REJECT_THRESHOLD rows.
-    # First-uploader wins by R2's LastModified on dataset.parquet (with the
-    # manifest's created_at as a fallback).
+    # 同周期跨矿工去重
     candidates, cross_miner_rejections = await _filter_cross_miner_overlap(
         candidates, store_for_hotkey
     )
@@ -605,7 +629,14 @@ async def gather_candidates(
 
 
 async def determine_next_cycle_id(nexis_miner: NexisMinerBucket) -> int | None:
-    """Return the cycle_id to train, or None if the previous cycle hasn't finished scoring."""
+    """
+    确定下一个应该训练的 cycle_id。
+
+    规则：
+    - 如果没有任何 cycle → 返回 1
+    - 如果最新的 cycle 还没有 total_score → 返回 None（等待评分完成）
+    - 否则返回 latest + 1
+    """
     latest = await nexis_miner.latest_cycle_id()
     if latest is None:
         return 1
@@ -615,6 +646,7 @@ async def determine_next_cycle_id(nexis_miner: NexisMinerBucket) -> int | None:
 
 
 async def cleanup_workdir(path: Path) -> None:
+    """清理临时工作目录。"""
     if not path.exists():
         return
     try:
@@ -639,6 +671,18 @@ async def run_training_cycle(
     eval_data_dir: Path,
     on_select: Callable[[list[str], int], Any] | None = None,
 ) -> TrainingCycleResult:
+    """
+    执行一个完整的训练周期。
+
+    四阶段流程：
+    1. 筛选候选矿工（eligible）
+    2. 并行验证数据集，产出 candidates
+    3. GPU 池并行训练所有通过的矿工
+    4. 上传训练结果到共享 bucket
+
+    同时更新 invalid_hotkeys：被接受和被拒绝的矿工都标记为 invalid，
+    避免下一轮重复验证，除非他们进入 Top-5。
+    """
     last_winners = parse_last_winners(last_total_score)
     eligible = await select_eligible_hotkeys(
         candidate_hotkeys=candidate_hotkeys,
@@ -673,13 +717,10 @@ async def run_training_cycle(
     rejected_hotkeys = [
         outcome.miner_hotkey for outcome in rejections if outcome.miner_hotkey
     ]
-    # Mark BOTH accepted and rejected miners as invalid for this network:
-    #   * accepted   → "we already trained on this miner; don't pick again
-    #                   unless they win a top-5 slot"
-    #   * rejected   → "this miner's last upload failed strict validation;
-    #                   don't waste time re-validating the same bad dataset"
-    # Either path keeps a miner out of the eligibility pool until they make
-    # the previous-cycle's top-5 (the only re-entry route).
+    # 被接受和被拒绝的矿工都标记为 invalid：
+    #   - 被接受 → 已训练，不要重复训练
+    #   - 被拒绝 → 数据有问题，不要再浪费时间验证
+    # 唯一的重新进入途径：进入上一周期的 Top-5
     hotkeys_to_invalidate = sorted({*selected_hotkeys, *rejected_hotkeys})
     if on_select and hotkeys_to_invalidate:
         maybe = on_select(hotkeys_to_invalidate, cycle_id)
@@ -694,7 +735,7 @@ async def run_training_cycle(
 
     cycle_scratch = workdir / "cycle" / str(cycle_id)
 
-    # Phase 2: TRAIN ALL miners (no uploads yet). 8 in parallel via GPU pool.
+    # 阶段 2：并行训练所有通过的矿工（GPU 池）
     async def _train(candidate: TrainingCandidate) -> tuple[TrainingCandidate, Path | None]:
         outputs_dir = await run_train_container(
             settings=settings,
@@ -729,9 +770,7 @@ async def run_training_cycle(
             len(cycle_result.failed_training),
         )
 
-    # Phase 3: UPLOAD all successful outputs.  Per-miner uploads run in
-    # parallel (one task per miner); within each miner, individual files
-    # are also uploaded concurrently up to `upload_concurrency`.
+    # 阶段 3：上传所有成功训练的结果
     upload_conc = max(int(getattr(settings, "upload_concurrency", 8)), 1)
 
     async def _upload_one(trained: TrainedMiner) -> tuple[str, bool]:
@@ -761,12 +800,12 @@ async def run_training_cycle(
             else:
                 cycle_result.failed_upload.append(hotkey)
 
-    # Persist training_state only for fully-successful miners (trained + uploaded).
+    # 只有训练成功且上传成功的矿工才更新 training_state
     for trained in trained_miners:
         if trained.miner_hotkey in cycle_result.uploaded:
             training_state[trained.miner_hotkey] = trained.interval_id
     save_training_state(workdir, training_state)
 
-    # Cleanup scratch (cycle workdir).
+    # 清理临时目录
     await cleanup_workdir(cycle_scratch)
     return cycle_result
