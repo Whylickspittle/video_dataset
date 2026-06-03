@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -60,7 +60,7 @@ FFMPEG_CRF = "22"
 MAX_WORKERS = 1
 
 
-def run_cmd(cmd: list[str], timeout: int = 180) -> str:
+def run_cmd(cmd: List[str], timeout: int = 180) -> str:
     """运行命令，返回 stdout。"""
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=timeout, check=True
@@ -80,7 +80,7 @@ def get_stream_url(video_url: str, min_height: int = 1080) -> str:
     return run_cmd(cmd, timeout=30)
 
 
-def get_video_info(video_url: str) -> dict:
+def get_video_info(video_url: str) -> Dict:
     """获取视频元数据。"""
     cmd = [
         "yt-dlp",
@@ -253,7 +253,7 @@ class SimpleDB:
         row = self.conn.execute("SELECT COUNT(*) FROM clips").fetchone()
         return row[0]
 
-    def get_all_records(self) -> list[dict]:
+    def get_all_records(self) -> List[Dict]:
         rows = self.conn.execute("SELECT * FROM clips").fetchall()
         records = []
         for r in rows:
@@ -281,7 +281,7 @@ class SimpleDB:
 
 
 def process_single_clip(url: str, start_sec: float, output_dir: Path,
-                        db: SimpleDB, args) -> Optional[dict]:
+                        db: SimpleDB, args) -> Optional[Dict]:
     """
     处理单个切片。返回 metadata dict 或 None（失败/重复）。
     """
@@ -380,7 +380,7 @@ def process_single_clip(url: str, start_sec: float, output_dir: Path,
     }
 
 
-def generate_manifest(records: list[dict], args) -> dict:
+def generate_manifest(records: List[Dict], args) -> Dict:
     """生成 manifest.json。"""
     total_size = 0
     for r in records:
@@ -405,7 +405,7 @@ def generate_manifest(records: list[dict], args) -> dict:
     }
 
 
-def export_parquet(records: list[dict], output_path: Path):
+def export_parquet(records: List[Dict], output_path: Path):
     """导出 dataset.parquet。"""
     if not records:
         print("[WARN] No records to export")
