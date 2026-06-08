@@ -1,5 +1,7 @@
-"""Miner interval pipeline: build a 400-sample dataset and upload it."""
-"""
+from __future__ import annotations
+
+"""Miner interval pipeline: build a 400-sample dataset and upload it.
+
 矿工核心流水线：从 sources.txt 读取视频源，生成 400 段切片数据集并上传。
 
 整个流程：
@@ -10,8 +12,6 @@
 5. 写入 dataset.parquet + manifest.json
 6. 上传到 R2/S3（parquet + clips + frames + manifest）
 """
-
-from __future__ import annotations
 
 import logging
 import math
@@ -142,20 +142,25 @@ class MinerPipeline:
         # 数据集内去重保护：记录每个 canonical URL 已使用的起始时间点
         seen_positions: dict[str, list[float]] = {}
 
-        # 读取 sources.txt
-        urls = list(self.source_provider.read_sources(sources_file))
-        if not urls:
+        # 读取 sources.txt → list[(url, start_offset_sec)]
+        sources = list(self.source_provider.read_sources(sources_file))
+        if not sources:
             raise RuntimeError(f"no sources defined in {sources_file}")
 
         # 逐个处理视频源
-        for url in urls:
+        for url, time_offset in sources:
             if len(records) >= self.sample_count:
                 break
             canonical = _canonical_url(url)
             source_id = self.source_provider.source_video_id(url)
-            logger.info("processing source source_id=%s url=%s", source_id, url)
+            logger.info(
+                "processing source source_id=%s url=%s offset=%.3f",
+                source_id, url, time_offset,
+            )
             try:
-                raw_path = self.source_provider.download(url, raw_dir)
+                raw_path = self.source_provider.download(
+                    url, raw_dir, start_sec=time_offset
+                )
             except Exception as exc:
                 logger.warning("source download failed url=%s err=%s", url, exc)
                 continue
@@ -166,11 +171,15 @@ class MinerPipeline:
                 logger.warning("source probe failed path=%s err=%s", raw_path, exc)
                 continue
 
-            # 计算视频可切出的段数
-            duration = float(probe.get("format", {}).get("duration") or 0.0)
-            total_segments = int(math.floor(duration / CLIP_DURATION_SEC))
+            # 计算视频从 time_offset 开始可切出的段数
+            full_duration = float(probe.get("format", {}).get("duration") or 0.0)
+            available_duration = max(0.0, full_duration - time_offset)
+            total_segments = int(math.floor(available_duration / CLIP_DURATION_SEC))
             if total_segments <= 0:
-                logger.warning("source has no usable segments source_id=%s", source_id)
+                logger.warning(
+                    "source has no usable segments after offset=%.3f source_id=%s",
+                    time_offset, source_id,
+                )
                 continue
 
             # 检查分辨率是否达标（>= 1280x704）
@@ -188,11 +197,11 @@ class MinerPipeline:
                 )
                 continue
 
-            # 逐段切片
+            # 逐段切片（从 time_offset 开始）
             for idx in range(total_segments):
                 if len(records) >= self.sample_count:
                     break
-                start = float(idx) * CLIP_DURATION_SEC
+                start = time_offset + float(idx) * CLIP_DURATION_SEC
 
                 # 数据集内去重保护：同一视频内，起始时间差 < 4.5 秒则跳过
                 positions = seen_positions.setdefault(canonical, [])

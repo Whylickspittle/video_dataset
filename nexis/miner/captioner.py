@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Per-clip captioning for the miner pipeline.
 
 The captioner takes the first frame of each clip and asks an OpenAI-compatible
@@ -14,8 +16,6 @@ returns an empty string and the trainer falls back to its default prompt.
 
 如果没有配置 API Key，captioner 会生成空字符串，Trainer 会回退到默认 prompt。
 """
-
-from __future__ import annotations
 
 import base64
 import logging

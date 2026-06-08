@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Strict dataset validation for v2 protocol (spec + global overlap)."""
 """
 严格的数据集验证模块（v2 协议）。
@@ -12,8 +14,6 @@
 
 任何一项硬性检查失败，整个数据集立即被拒绝。
 """
-
-from __future__ import annotations
 
 import asyncio
 import logging

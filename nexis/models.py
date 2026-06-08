@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Core schema models for Nexisgen miner submissions."""
 """
 Nexisgen 核心数据模型。
@@ -7,8 +9,6 @@ Nexisgen 核心数据模型。
 - IntervalManifest: 每个 interval 的提交清单
 - ValidationDecision: 验证者对该矿工的最终判定
 """
-
-from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any

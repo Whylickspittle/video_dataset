@@ -1,5 +1,7 @@
-"""Protocol-level constants and policy decisions for Nexisgen."""
-"""
+from __future__ import annotations
+
+"""Protocol-level constants and policy decisions for Nexisgen.
+
 Nexisgen 协议级常量与策略定义。
 
 本文件定义了整个子网（Subnet 70）的核心规则：
@@ -7,8 +9,6 @@ Nexisgen 协议级常量与策略定义。
 - 去重策略（三层去重的阈值）
 - 链上权重提交的周期与衰减规则
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 

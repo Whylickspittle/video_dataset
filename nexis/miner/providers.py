@@ -16,11 +16,11 @@ from .youtube import (
 
 
 class SourceProvider(Protocol):
-    def read_sources(self, path: Path) -> list[str]: ...
+    def read_sources(self, path: Path) -> list[tuple[str, float]]: ...
 
     def source_video_id(self, url: str) -> str: ...
 
-    def download(self, url: str, output_dir: Path) -> Path: ...
+    def download(self, url: str, output_dir: Path, *, start_sec: float) -> Path: ...
 
     def probe(self, path: Path) -> dict[str, Any]: ...
 
@@ -32,7 +32,7 @@ class SourceProvider(Protocol):
 class GenericSourceProvider:
     """yt-dlp-backed provider that supports any public video platform."""
 
-    def read_sources(self, path: Path) -> list[str]:
+    def read_sources(self, path: Path) -> list[tuple[str, float]]:
         return read_sources(path)
 
     def source_video_id(self, url: str) -> str:
@@ -52,8 +52,8 @@ class GenericSourceProvider:
             return f"{host}_{parsed.path.strip('/').replace('/', '_') or 'root'}"
         return url
 
-    def download(self, url: str, output_dir: Path) -> Path:
-        return download_source_video(url, output_dir)
+    def download(self, url: str, output_dir: Path, *, start_sec: float = 0.0) -> Path:
+        return download_source_video(url, output_dir, start_sec=start_sec)
 
     def probe(self, path: Path) -> dict[str, Any]:
         return probe_video(path)

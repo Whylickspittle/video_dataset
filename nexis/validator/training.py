@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Owner-trainer orchestrator for the `nexis train` command.
 
 Trainer container expectations (matching `rendixnetwork/train:latest`):
@@ -36,8 +38,6 @@ Owner 训练编排器。
 - candidate: 通过验证的矿工候选
 - training_state: 记录每个矿工上次被训练的 interval_id
 """
-
-from __future__ import annotations
 
 import asyncio
 import json

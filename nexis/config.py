@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Runtime configuration for Nexisgen."""
 """
 Nexisgen 运行时配置。
@@ -11,8 +13,6 @@ Nexisgen 运行时配置。
 - Trainer (Owner): GPU 数量、Docker 镜像、训练超时
 - API Server: PostgreSQL、验证者白名单
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 

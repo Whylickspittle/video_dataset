@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Nexis CLI: mine, train, validate, commit-credentials."""
 """
 Nexis CLI 入口。
@@ -8,8 +10,6 @@ Nexis CLI 入口。
 3. nexis validate      → 验证者循环（VBench 评分 + 权重提交）
 4. nexis commit-credentials → 将矿工 R2 读取凭据提交到链上
 """
-
-from __future__ import annotations
 
 import asyncio
 import json
